@@ -47,6 +47,25 @@ TEST_F(TransactionTest, create_witness)
     EXPECT_TRUE(res.witness.valid(conn->get_server_cert()));
 }
 
+TEST_F(TransactionTest, read_only_tx)
+{
+    auto conn = create_client("test", "testserver", "localhost");
+    auto c = conn->get_collection("default");
+    c->put("food", json::String("apple"));
+
+    auto start_size = json::Document(conn->get_statistics(), "total_file_size").as_integer();
+
+    auto t = conn->init_transaction(IsolationLevel::RepeatableRead);
+    auto tc = t->get_collection("default");
+    tc->get("food");
+    auto res = t->commit(true);
+    EXPECT_TRUE(res.success);
+
+    auto end_size = json::Document(conn->get_statistics(), "total_file_size").as_integer();
+
+    EXPECT_EQ(start_size, end_size);
+}
+
 TEST_F(TransactionTest, update_value)
 {
     auto conn = create_client("test", "testserver", "localhost");
@@ -65,8 +84,7 @@ TEST_F(TransactionTest, update_value)
     res = t->commit(true);
     EXPECT_TRUE(res.success);
 
-
-    EXPECT_EQ(json::String("orange"), conn->get_collection("default")->get("food"));
+    EXPECT_EQ(json::String("orange"), c->get("food"));
 }
 
 TEST_F(TransactionTest, get_field)
@@ -308,10 +326,14 @@ TEST_F(TransactionTest, atomicity_isolation)
 
     std::vector<std::thread> threads_transfer;
     for (int i = 0; i < 4; ++i)
+    {
         threads_transfer.emplace_back(func_transfer);
+    }
 
     for (auto &t : threads_transfer)
+    {
         t.join();
+    }
 
     auto b1 = json::Document(c->get(name1), "balance").as_integer();
     auto b2 = json::Document(c->get(name2), "balance").as_integer();
@@ -435,9 +457,13 @@ void phantom_read(IsolationLevel isolation)
         
     ASSERT_FALSE(res3.success);
     if (isolation < IsolationLevel::Serializable)
+    {
         ASSERT_EQ(res3.error, "Key [" + key1 + "] reads outdated value");
+    }
     else
+    {
         ASSERT_EQ(res3.error, "Phantom read: too few results");
+    }
 }
 
 TEST_F(TransactionTest, ReadCommitted_disallow_dirty_read)

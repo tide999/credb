@@ -833,7 +833,7 @@ void RemoteParty::handle_request_upstream_mode(bitstream &input,
         input >> peer_type;
         log_debug("OperationType::TellPeerType: local_identifier()=" + std::to_string(local_identifier()) +
                   " peer_type=" + std::to_string(peer_type));
-        auto *self = dynamic_cast<Peer *>(this);
+        auto *self = dynamic_cast<Peer*>(this);
         self->set_peer_type(peer_type);
         bitstream bstream;
 
@@ -842,14 +842,16 @@ void RemoteParty::handle_request_upstream_mode(bitstream &input,
         bstream.write_raw_data(reinterpret_cast<const uint8_t *>(disk_key), sizeof(disk_key));
 
         log_debug("Sending collection list");
-        std::vector<std::string> collection_names;
-        
-        for(const auto &item : m_ledger.collections())
-        {
-            collection_names.emplace_back(item.first);
-        }
 
-        bstream << collection_names;
+        auto &cols = m_ledger.collections();
+        uint32_t size = cols.size();
+        bstream << size;
+
+        for(auto &[name, col] : cols)
+        {
+            bstream << name;
+            col.primary_index().serialize_root(bstream);
+        }
 
         output << bstream;
         break;
@@ -905,17 +907,10 @@ void RemoteParty::handle_request_has_object(bitstream &input, const OpContext &o
 
 void RemoteParty::handle_request_get_object(bitstream &input, const OpContext &op_context, bitstream &output, bool generate_witness)
 {
-    std::string collection, key;
-    input >> collection >> key;
+    std::string collection, full_path;
+    input >> collection >> full_path;
 
-    std::string path;
-    size_t ppos;
-
-    if((ppos = key.find(".")) != std::string::npos)
-    {
-        path = key.substr(ppos + 1, std::string::npos);
-        key = key.substr(0, ppos);
-    }
+    auto [key, path] = parse_path(full_path);
 
     auto it = m_ledger.iterate(op_context, collection, key, path);
     auto [eid, value] = it.next();
@@ -952,7 +947,6 @@ void RemoteParty::handle_request_get_object(bitstream &input, const OpContext &o
         output << bstream;
     }
 }
-
 
 } // namespace trusted
 } // namespace credb

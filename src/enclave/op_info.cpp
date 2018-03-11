@@ -31,10 +31,16 @@ check_obj_info_t::check_obj_info_t(Transaction &tx, const std::string &collectio
 
 void check_obj_info_t::collect_shard_lock_type()
 {
-    transaction().set_read_lock_if_not_present(m_sid);
+    transaction().set_read_lock(m_sid);
 }
 
-bool check_obj_info_t::validate_read()
+void check_obj_info_t::extract_reads(std::unordered_set<event_id_t> &read_set)
+{
+    //FIXME
+    (void)read_set;
+}
+
+bool check_obj_info_t::validate()
 {
     {
         auto res = transaction().ledger.check(transaction().op_context, m_collection, m_key, "", m_predicates);
@@ -72,15 +78,21 @@ has_obj_info_t::has_obj_info_t(Transaction &tx, const std::string &collection, c
       m_sid(get_shard(m_collection, m_key))
 {}
 
-void has_obj_info_t::collect_shard_lock_type()
+void has_obj_info_t::extract_reads(std::unordered_set<event_id_t> &read_set)
 {
-    transaction().set_read_lock_if_not_present(m_sid);
+    //FIXME
+    (void)read_set;
 }
 
-bool has_obj_info_t::validate_read()
+void has_obj_info_t::collect_shard_lock_type()
+{
+    transaction().set_read_lock(m_sid);
+}
+
+bool has_obj_info_t::validate()
 {
     {
-        auto res = transaction().ledger.has_object(m_collection, m_key);
+        auto res = transaction().ledger.has_object(m_collection, m_key, &transaction().lock_handle);
         
         if(res != m_result)
         {
@@ -115,12 +127,17 @@ get_info_t::get_info_t(Transaction &tx, const std::string &collection, const std
            m_sid(get_shard(collection, key))
 {}
 
-void get_info_t::collect_shard_lock_type()
+void get_info_t::extract_reads(std::unordered_set<event_id_t> &read_set)
 {
-    transaction().set_read_lock_if_not_present(m_sid);
+    read_set.insert(m_eid);
 }
 
-bool get_info_t::validate_read()
+void get_info_t::collect_shard_lock_type()
+{
+    transaction().set_read_lock(m_sid);
+}
+
+bool get_info_t::validate()
 {
     ObjectEventHandle obj;
     if(transaction().isolation_level() != IsolationLevel::ReadCommitted)
@@ -132,13 +149,11 @@ bool get_info_t::validate_read()
     }
     else
     {
-        const LockType lock_type = transaction().shards_lock_type[m_sid];
         event_id_t latest_eid;
-        
-        bool res = transaction().ledger.get_latest_version(obj, transaction().op_context, m_collection, m_key, "",
-                                                 latest_eid, transaction().lock_handle, lock_type);
+       
+        obj = transaction().ledger.get_latest_version(transaction().op_context, m_collection, m_key, "", latest_eid, transaction().lock_handle, LockType::Read);
 
-        if(!res)
+        if(!obj.valid())
         {
             return false;
         }
@@ -173,20 +188,35 @@ put_info_t::put_info_t(Transaction &tx, const std::string &collection, const std
     m_sid = get_shard(m_collection, m_key);
 }
 
-void put_info_t::collect_shard_lock_type()
+void put_info_t::extract_writes(std::array<uint16_t, NUM_SHARDS> &write_set)
 {
-    transaction().shards_lock_type[m_sid] = LockType::Write;
+    write_set[m_sid] += 1;
 }
 
-bool put_info_t::do_write()
+void put_info_t::collect_shard_lock_type()
 {
-    const event_id_t new_eid = transaction().ledger.put(transaction().op_context, m_collection, m_key, m_doc, "", &transaction().lock_handle);
+    transaction().set_write_lock(m_sid);
+}
+
+bool put_info_t::validate()
+{
+    auto [key, path] = parse_path(m_key);
+
+    return transaction().ledger.prepare_write(transaction().op_context, m_collection, key, path, OperationType::PutObject, &transaction().lock_handle);
+}
+
+bool put_info_t::do_write(std::unordered_set<event_id_t> &read_set,
+                          std::unordered_set<event_id_t> &write_set)
+{
+    auto [key, path] = parse_path(m_key);
+
+    const event_id_t new_eid = transaction().ledger.apply_write(transaction().op_context, m_collection, key, m_doc, path, &transaction().lock_handle, OperationType::PutObject, read_set, write_set);
 
     if(new_eid && transaction().generate_witness)
     {
         auto &writer = transaction().writer;
 
-        writer.start_map("");
+        writer.start_map();
         writer.write_string("type", "PutObject");
         writer.write_string("collection", m_collection);
         writer.write_string("key", m_key);
@@ -213,14 +243,29 @@ add_info_t::add_info_t(Transaction &tx, const std::string &collection, const std
     m_sid = transaction().ledger.get_shard(m_collection, m_key);
 }
 
-void add_info_t::collect_shard_lock_type()
+bool add_info_t::validate()
 {
-    transaction().shards_lock_type[m_sid] = LockType::Write;
+    auto [key, path] = parse_path(m_key);
+
+    return transaction().ledger.prepare_write(transaction().op_context, m_collection, key, path, OperationType::AddToObject, &transaction().lock_handle);
 }
 
-bool add_info_t::do_write()
+void add_info_t::extract_writes(std::array<uint16_t, NUM_SHARDS> &write_set)
 {
-    const event_id_t new_eid = transaction().ledger.add(transaction().op_context, m_collection, m_key, m_doc, "", &transaction().lock_handle);
+    write_set[m_sid] += 1;
+}
+
+void add_info_t::collect_shard_lock_type()
+{
+    transaction().set_write_lock(m_sid);
+}
+
+bool add_info_t::do_write(std::unordered_set<event_id_t> &read_set,
+                          std::unordered_set<event_id_t> &write_set)
+{
+    auto [key, path] = parse_path(m_key);
+    
+    const event_id_t new_eid = transaction().ledger.apply_write(transaction().op_context, m_collection, key, m_doc, path, &transaction().lock_handle, OperationType::AddToObject, read_set, write_set);
 
     if(transaction().generate_witness)
     {
@@ -239,27 +284,42 @@ bool add_info_t::do_write()
     return true;
 }
 
-void remove_info_t::read_from_req(bitstream &req)
+remove_info_t::remove_info_t(Transaction &tx, bitstream &req)
+    : write_op_t(tx)
 {
-    req >> collection >> key;
-    sid = transaction().ledger.get_shard(collection, key);
+    req >> m_collection >> m_key;
+    m_sid = transaction().ledger.get_shard(m_collection, m_key);
+}
+
+bool remove_info_t::validate()
+{
+    return transaction().ledger.prepare_write(transaction().op_context, m_collection, m_key, "", OperationType::RemoveObject, &transaction().lock_handle);
+}
+
+void remove_info_t::extract_writes(std::array<uint16_t, NUM_SHARDS> &write_set)
+{
+    write_set[m_sid] += 1;
 }
 
 void remove_info_t::collect_shard_lock_type()
 {
-    transaction().shards_lock_type[sid] = LockType::Write;
+    transaction().set_write_lock(m_sid);
 }
 
-bool remove_info_t::do_write()
+bool remove_info_t::do_write(std::unordered_set<event_id_t> &read_set,
+                          std::unordered_set<event_id_t> &write_set)
 {
-    const event_id_t new_eid = transaction().ledger.remove(transaction().op_context, collection, key, &transaction().lock_handle);
+    json::Document doc;
+
+    const event_id_t new_eid = transaction().ledger.apply_write(transaction().op_context, m_collection, m_key, doc, "", &transaction().lock_handle, OperationType::RemoveObject, read_set, write_set);
+
     if(transaction().generate_witness)
     {
         auto &writer = transaction().writer;
 
         writer.start_map("");
         writer.write_string("type", "RemoveObject");
-        writer.write_string("key", key);
+        writer.write_string("key", m_key);
         writer.write_integer("shard", new_eid.shard);
         writer.write_integer("block", new_eid.block);
         writer.write_integer("index", new_eid.index);
@@ -268,7 +328,8 @@ bool remove_info_t::do_write()
     return true;
 }
 
-void find_info_t::read_from_req(bitstream &req)
+find_info_t::find_info_t(Transaction &tx, bitstream &req)
+        : read_op_t(tx)
 {
     req >> collection >> predicates >> projection >> limit;
     uint32_t size = 0;
@@ -283,6 +344,16 @@ void find_info_t::read_from_req(bitstream &req)
     }
 }
 
+void find_info_t::extract_reads(std::unordered_set<event_id_t> &read_set)
+{
+    for(auto &[key, shard, eid]: res)
+    {
+        (void)key;
+        (void)shard;
+        read_set.insert(eid);
+    }
+}
+
 void find_info_t::collect_shard_lock_type()
 {
     if(transaction().isolation_level() == IsolationLevel::Serializable)
@@ -290,7 +361,7 @@ void find_info_t::collect_shard_lock_type()
         // Lock all shards to avoid phantom reads
         for(shard_id_t i = 0; i < NUM_SHARDS; ++i)
         {
-            transaction().set_read_lock_if_not_present(i);
+            transaction().set_read_lock(i);
         }
     }
     else
@@ -298,7 +369,7 @@ void find_info_t::collect_shard_lock_type()
         // Only lock what we read
         for(const auto &it : res)
         {
-            transaction().set_read_lock_if_not_present(std::get<1>(it));
+            transaction().set_read_lock(std::get<1>(it));
         }
     }
 }
@@ -321,14 +392,14 @@ void find_info_t::write_witness(
 
 bool find_info_t::validate_no_dirty_read()
 {
-    for(const auto & [key, sid, eid] : res)
+    for(const auto &[key, sid, eid] : res)
     {
-        const LockType lock_type = transaction().shards_lock_type[sid];
+        (void)sid;
         event_id_t latest_eid;
-        ObjectEventHandle obj;
-        bool res = transaction().ledger.get_latest_version(obj, transaction().op_context, collection, key, "",
-                                                 latest_eid, transaction().lock_handle, lock_type);
-        if(!res)
+
+        auto hdl = transaction().ledger.get_latest_version(transaction().op_context, collection, key, "", latest_eid, transaction().lock_handle, LockType::Read);
+        
+        if(!hdl.valid())
         {
             transaction().error = "Key [" + key + "] reads outdated value";
             return false;
@@ -336,7 +407,7 @@ bool find_info_t::validate_no_dirty_read()
 
         if(transaction().generate_witness)
         {
-            write_witness(key, eid, obj.value());
+            write_witness(key, eid, hdl.value());
         }
     }
     return true;
@@ -407,20 +478,20 @@ bool find_info_t::validate_no_phantom()
     return true;
 }
 
-bool find_info_t::validate_read()
+bool find_info_t::validate()
 {
     if(transaction().generate_witness)
     {
         auto &writer = transaction().writer;
 
-        writer.start_map("");
+        writer.start_map();
         writer.write_string("type", "FindObjects");
         writer.write_string("collection", collection);
         writer.write_document("predicates", predicates);
         writer.start_array("projection");
         for(const auto &proj : projection)
         {
-            writer.write_string("", proj);
+            writer.write_string(proj);
         }
         writer.end_array();
         writer.write_integer("limit", limit);

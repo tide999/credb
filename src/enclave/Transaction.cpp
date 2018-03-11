@@ -25,7 +25,7 @@ Transaction::Transaction(bitstream &request, Ledger &ledger_, const OpContext &o
         // FIXME: how to avoid phantom read while avoiding locking all shards?
         for(shard_id_t i = 0; i < NUM_SHARDS; ++i)
         {
-            shards_lock_type[i] = LockType::Read;
+            m_shard_lock_types[i] = LockType::Read;
         }
     }
 
@@ -56,7 +56,7 @@ void Transaction::clear()
 
     if(!lock_handle.has_parent())
     {
-        for(auto &kv : shards_lock_type)
+        for(auto &kv : m_shard_lock_types)
         {
             ledger.organize_ledger(kv.first);
         }
@@ -70,12 +70,17 @@ void Transaction::clear()
     m_ops.clear();
 }
 
-void Transaction::set_read_lock_if_not_present(shard_id_t sid)
+void Transaction::set_read_lock(shard_id_t sid)
 {
-    if(!shards_lock_type.count(sid))
+    if(!m_shard_lock_types.count(sid))
     {
-        shards_lock_type[sid] = LockType::Read;
+        m_shard_lock_types[sid] = LockType::Read;
     }
+}
+
+void Transaction::set_write_lock(shard_id_t sid)
+{
+    m_shard_lock_types[sid] = LockType::Write;
 }
 
 bool Transaction::check_repeatable_read(ObjectEventHandle &obj,
@@ -87,16 +92,17 @@ bool Transaction::check_repeatable_read(ObjectEventHandle &obj,
     auto [key, path] = parse_path(full_path);
     (void)path; //if eid hasn't changed value hasn't change either so no need to check path
 
-    const LockType lock_type = shards_lock_type[sid];
+    const LockType lock_type = m_shard_lock_types[sid];
     event_id_t latest_eid;
-    bool res = ledger.get_latest_version(obj, op_context, collection, key, "", latest_eid,
-                                             lock_handle, lock_type);
 
-    if(!res || latest_eid != eid)
+    obj = ledger.get_latest_version(op_context, collection, key, "", latest_eid, lock_handle, lock_type);
+
+    if(!obj.valid() || latest_eid != eid)
     {
         error = "Key [" + key + "] reads outdated value";
         return false;
     }
+
     return true;
 }
 
@@ -137,7 +143,7 @@ void Transaction::register_operation(operation_info_t *op)
 bool Transaction::phase_one()
 {
     // first acquire locks for all pending shards to ensure atomicity
-    for(auto &kv : shards_lock_type)
+    for(auto &kv : m_shard_lock_types)
     {
         lock_handle.get_shard(kv.first, kv.second);
     }
@@ -167,7 +173,7 @@ bool Transaction::phase_one()
     // validate reads
     for(auto op : m_ops)
     {
-        if(!op->validate_read())
+        if(!op->validate())
         {
             return false;
         }
@@ -178,10 +184,29 @@ bool Transaction::phase_one()
 
 Witness Transaction::phase_two()
 {
-    // then do writes
+    std::unordered_set<event_id_t> read_set, write_set;
+    std::array<uint16_t, NUM_SHARDS> write_shards;
+    write_shards.fill(0);
+
     for(auto op : m_ops)
     {
-        if(!op->do_write())
+        op->extract_reads(read_set);
+        op->extract_writes(write_shards);
+    }
+
+    for(shard_id_t shard = 0; shard < write_shards.size(); ++shard)
+    {
+        auto num = write_shards[shard];
+
+        if(num > 0)
+        {
+            ledger.get_next_event_ids(write_set, shard, num, &lock_handle);
+        }
+    }
+
+    for(auto op : m_ops)
+    {
+        if(!op->do_write(read_set, write_set))
         {
             assert(!error.empty());
             throw std::runtime_error(error);
@@ -190,7 +215,6 @@ Witness Transaction::phase_two()
 
     Witness witness;
     
-    // close witness root
     if(generate_witness)
     {
         writer.end_array(); // operations
@@ -199,7 +223,6 @@ Witness Transaction::phase_two()
 
     if(error.empty())
     {
-        // create witness
         if(generate_witness)
         {
             json::Document doc = writer.make_document();

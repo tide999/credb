@@ -23,7 +23,7 @@
 #include "Peers.h"
 #include "PendingBooleanResponse.h"
 #include "Shard.h"
-#include "StringIndex.h"
+#include "HashMap.h"
 #include "credb/Client.h"
 #include "logging.h"
 
@@ -42,7 +42,7 @@ namespace trusted
 
 Ledger::Ledger(Enclave &enclave)
 : m_enclave(enclave), m_buffer_manager(m_enclave.buffer_manager()),
-  m_object_count(0), m_version_count(0), m_put_object_index_last_id(0), m_put_object_index_running(false)
+  m_object_count(0), m_version_count(0)
 {
     for(auto &shard : m_shards)
     {
@@ -63,9 +63,10 @@ Ledger::~Ledger()
 
 void Ledger::clear_cached_blocks()
 {
-    for(auto &shard : m_shards)
+    for(auto shard : m_shards)
     {
-        shard->reload_pending_block();
+        WriteLock lock(*shard);
+        shard->discard_pending_block();
     }
 }
 
@@ -75,17 +76,17 @@ bitstream Ledger::prepare_call(const OpContext &op_context,
                                const std::string &path)
 {
     LockHandle lock_handle(*this);
-    ObjectEventHandle obj;
     event_id_t eid;
 
-    if(!get_latest_version(obj, op_context, collection, key, path, eid, lock_handle, LockType::Read,
-                           OperationType::CallProgram))
+    auto hdl = get_latest_version(op_context, collection, key, path, eid, lock_handle, LockType::Read, OperationType::CallProgram);
+
+    if(!hdl.valid())
     {
         log_error("No such object: " + key);
         return bitstream();
     }
 
-    auto val = obj.value(path);
+    auto val = hdl.value(path);
 
     if(val.get_type() != json::ObjectType::Binary)
     {
@@ -113,6 +114,21 @@ void Ledger::remove_triggers_for(remote_party_id identifier)
     }
 }
 
+void Ledger::get_next_event_ids(std::unordered_set<event_id_t> &out, shard_id_t shard, uint16_t num, LockHandle *lock_handle_)
+{
+    LockHandle lock_handle(*this, lock_handle_);
+
+    auto pending = lock_handle.get_pending_block(shard, LockType::Write);
+    auto pos = static_cast<event_index_t>(pending->num_events());
+
+    for(event_index_t i = 0; i < num; ++i)
+    {
+        //FIXME what if a new block will be created? 
+        event_index_t idx = pos+i;
+        out.insert({shard, pending->identifier(), idx});
+    }
+}
+
 bool Ledger::unset_trigger(const std::string &collection, remote_party_id identifier)
 {
     auto c = try_get_collection(collection);
@@ -127,8 +143,10 @@ bool Ledger::unset_trigger(const std::string &collection, remote_party_id identi
 }
 
 
-bool Ledger::has_object(const std::string &collection, const std::string &key)
+bool Ledger::has_object(const std::string &collection, const std::string &key, LockHandle *lock_handle_)
 {
+    LockHandle lock_handle(*this, lock_handle_);
+
     event_id_t id;
     auto col = try_get_collection(collection);
 
@@ -137,7 +155,13 @@ bool Ledger::has_object(const std::string &collection, const std::string &key)
         return false;
     }
 
-    return col->primary_index().get(key, id);
+    if(!col->primary_index().get(key, id))
+    {
+        return false;
+    }
+
+    auto hdl = get_event(id, lock_handle, LockType::Read);
+    return hdl.get_type() == ObjectEventType::NewVersion;
 }
 
 uint32_t Ledger::count_writes(const OpContext &op_context,
@@ -161,20 +185,19 @@ uint32_t Ledger::count_writes(const OpContext &op_context,
     return res;
 }
 
-bool Ledger::get_previous_event(shard_id_t shard_no,
-                                ObjectEventHandle &previous,
+ObjectEventHandle Ledger::get_previous_event(shard_id_t shard_no,
                                 const ObjectEventHandle &current,
                                 LockHandle &lock_handle,
                                 LockType lock_type)
 {
     if(!current.has_predecessor())
     {
-        return false;
+        return ObjectEventHandle();
     }
 
     auto block = lock_handle.get_block(shard_no, current.previous_block(), lock_type);
-    block->get_event(previous, current.previous_index());
-    return true;
+
+    return block->get_event(current.previous_index());
 }
 
 bool Ledger::check(const OpContext &op_context,
@@ -198,148 +221,52 @@ bool Ledger::check(const OpContext &op_context,
     }
 }
 
-bool Ledger::get_previous_version(shard_id_t shard_no,
-                                  ObjectEventHandle &out,
+ObjectEventHandle Ledger::get_previous_version(shard_id_t shard_no,
                                   const ObjectEventHandle &current_event,
                                   LockHandle &lock_handle,
                                   LockType lock_type)
 {
     block_id_t bid = INVALID_BLOCK;
-    ObjectEventHandle next_event;
-    next_event = current_event.duplicate();
+    auto next_event = current_event.duplicate();
 
     while(next_event.valid() && next_event.get_type() != ObjectEventType::NewVersion)
     {
         if(next_event.get_type() == ObjectEventType::Deletion)
         {
             lock_handle.release_block(shard_no, bid, lock_type);
-            return false;
+            return ObjectEventHandle();
         }
 
         if(!next_event.has_predecessor())
         {
             lock_handle.release_block(shard_no, bid, lock_type);
-            return false;
+            return ObjectEventHandle();
         }
 
         if(bid == next_event.previous_block())
         {
             auto block = lock_handle.get_block(shard_no, bid, lock_type);
-            block->get_event(next_event, next_event.previous_index());
+            next_event = block->get_event(next_event.previous_index());
         }
         else
         {
             auto next_bid = next_event.previous_block();
             auto block = lock_handle.get_block(shard_no, next_bid, lock_type);
 
-            block->get_event(next_event, next_event.previous_index());
+            next_event = block->get_event(next_event.previous_index());
 
             lock_handle.release_block(shard_no, bid, lock_type);
             bid = next_bid;
         }
     }
 
-    if(next_event.valid())
-    {
-        out = std::move(next_event);
-        return true;
-    }
-    else
-    {
-        return false;
-    }
+    return next_event;
 }
 
-bool Ledger::get_event(ObjectEventHandle &out, const event_id_t &eid, LockHandle &lock_handle, LockType lock_type)
+ObjectEventHandle Ledger::get_event(const event_id_t &eid, LockHandle &lock_handle, LockType lock_type)
 {
     auto block = lock_handle.get_block(eid.shard, eid.block, lock_type);
-    block->get_event(out, eid.index);
-    return true;
-}
-
-event_id_t Ledger::add(const OpContext &op_context,
-                       const std::string &collection,
-                       const std::string &key,
-                       json::Document &to_add,
-                       const std::string &path,
-                       LockHandle *lock_handle_)
-{
-    if(!Ledger::is_valid_key(key))
-    {
-        return INVALID_EVENT;
-    }
-
-    if(!check_collection_policy(op_context, collection, key, path, OperationType::AddToObject))
-    {
-        log_debug("rejected add because of collection policy");
-        return INVALID_EVENT;
-    }
-
-    auto s = get_shard(collection, key);
-
-    LockHandle lock_handle(*this, lock_handle_);
-
-    event_id_t previous_id = INVALID_EVENT;
-    version_number_t number = INITIAL_VERSION_NO;
-
-    ObjectEventHandle previous_event, previous_version;
-
-    bool has_latest_version = false;
-    bool has_latest_event =
-    get_latest_event(previous_event, collection, key, previous_id, lock_handle, LockType::Write);
-
-    if(has_latest_event)
-    {
-        has_latest_version =
-        get_previous_version(s, previous_version, previous_event, lock_handle, LockType::Write);
-
-        if(has_latest_version) // might have been deleted
-        {
-            number = previous_version.version_number() + 1;
-        }
-    }
-
-    event_id_t res;
-
-    if(!path.empty() && !has_latest_version)
-    {
-        // can't update
-        res = INVALID_EVENT;
-    }
-    else if(!has_latest_version)
-    {
-        res = put_next_version(op_context, collection, key, to_add, number, previous_id,
-                               previous_version, lock_handle);
-    }
-    else
-    {
-        json::Document view = previous_version.value();
-        json::Document policy(view, "policy", false);
-
-        if(!policy.empty() && !check_object_policy(policy, op_context, collection, key, path,
-                                                   OperationType::AddToObject, lock_handle))
-        {
-            log_debug("rejected add because of object policy");
-            res = INVALID_EVENT;
-        }
-        else
-        {
-            json::Document doc = view.duplicate(true);
-            doc.add(path, to_add);
-
-            res = put_next_version(op_context, collection, key, doc, number, previous_id,
-                                   previous_version, lock_handle);
-        }
-    }
-
-    lock_handle.clear();
-
-    if(!lock_handle_)
-    {
-        organize_ledger(get_shard(collection, key));
-    }
-
-    return res;
+    return block->get_event(eid.index);
 }
 
 bool Ledger::diff(const OpContext &op_context,
@@ -401,15 +328,13 @@ bool Ledger::create_witness(Witness &witness, const std::vector<event_id_t> &eve
         writer.write_integer(Witness::BLOCK_FIELD_NAME, eid.block);
         writer.write_integer(Witness::INDEX_FIELD_NAME, eid.index);
 
-        ObjectEventHandle event, prev;
-
-        bool res = get_event(event, eid, lock_handle, LockType::Read);
-        if(!res)
+        auto event = get_event(eid, lock_handle, LockType::Read);
+        if(!event.valid())
         {
             return false;
         }
 
-        bool has_prev = get_previous_event(eid.shard, prev, event, lock_handle, LockType::Read);
+        auto prev = get_previous_event(eid.shard, event, lock_handle, LockType::Read);
 
         writer.write_string("source", event.source());
 
@@ -417,7 +342,7 @@ bool Ledger::create_witness(Witness &witness, const std::vector<event_id_t> &eve
         {
             writer.write_string("type", "deletion");
         }
-        else if(has_prev && prev.get_type() != ObjectEventType::Deletion)
+        else if(prev.valid() && prev.get_type() != ObjectEventType::Deletion)
         {
             auto doc1 = event.value();
             auto doc2 = event.value();
@@ -459,7 +384,8 @@ bool Ledger::check_collection_policy(const OpContext &op_context,
                                      const std::string &collection,
                                      const std::string &key,
                                      const std::string &path,
-                                     OperationType type)
+                                     OperationType type,
+                                     LockHandle *lock_handle_)
 {
     if(!op_context.valid())
     {
@@ -469,7 +395,7 @@ bool Ledger::check_collection_policy(const OpContext &op_context,
     // Needed so we don't call the policy recursively
     OpContext empty_context(INVALID_IDENTITY);
 
-    LockHandle lock_handle(*this);
+    LockHandle lock_handle(*this, lock_handle_);
 
     auto it = iterate(empty_context, collection, "policy", "", &lock_handle);
     auto [eid,value] = it.next();
@@ -543,7 +469,7 @@ bool Ledger::check_object_policy(const json::Document &policy,
     }
     catch(std::exception &e)
     {
-        log_error(std::string("Object policy failed: ") + e.what());
+            log_error(std::string("Object policy failed: ") + e.what());
         return false;
     }
 }
@@ -554,6 +480,7 @@ event_id_t Ledger::put_without_key(const OpContext &op_context,
                        json::Document &to_put,
                        LockHandle *lock_handle_)
 {
+    std::unordered_set<event_id_t> read_set, write_set;
     (void)op_context;
 
     // Acquire lock to the corresponding shard
@@ -572,14 +499,12 @@ event_id_t Ledger::put_without_key(const OpContext &op_context,
         // Lock shard
         lock_handle.get_pending_block(shard, LockType::Write);
 
-        ObjectEventHandle prev_hdl;
         event_id_t prev_id;
-        bool exists = get_latest_event(prev_hdl, collection, key, prev_id, lock_handle, LockType::Write);
+        auto prev_hdl = get_latest_event(collection, key, prev_id, lock_handle, LockType::Write);
         
-        if(!exists)
+        if(!prev_hdl.valid())
         {
-            eid = put_next_version(op_context, collection, key, to_put, INITIAL_VERSION_NO, prev_id,
-                               prev_hdl, lock_handle);
+            eid = put_next_version(op_context, collection, key, to_put, INITIAL_VERSION_NO, prev_id, prev_hdl, lock_handle, read_set, write_set);
             key_out = key;
         }
     }
@@ -592,76 +517,103 @@ event_id_t Ledger::put_without_key(const OpContext &op_context,
     return eid;
 }
 
-event_id_t Ledger::put(const OpContext &op_context,
+event_id_t Ledger::apply_write(const OpContext &op_context,
                        const std::string &collection,
                        const std::string &key,
-                       json::Document &to_put,
+                       json::Document &to_write,
                        const std::string &path,
-                       LockHandle *lock_handle_)
+                       LockHandle *lock_handle_,
+                       OperationType op_type,
+                       const std::unordered_set<event_id_t> &read_set,
+                       const std::unordered_set<event_id_t> &write_set)
 {
-    if(!Ledger::is_valid_key(key))
-    {
-        return INVALID_EVENT;
-    }
-
-    if(!check_collection_policy(op_context, collection, key, path, OperationType::AddToObject))
-    {
-        log_debug("rejected add because of collection policy");
-        return INVALID_EVENT;
-    }
+    auto s = get_shard(collection, key);
 
     LockHandle lock_handle(*this, lock_handle_);
-
-    auto s = get_shard(collection, key);
 
     event_id_t res = INVALID_EVENT;
     event_id_t previous_id = INVALID_EVENT;
 
     version_number_t number = INITIAL_VERSION_NO;
 
-    ObjectEventHandle previous_event, previous_version;
-    bool has_previous_version = false;
-    bool has_previous_event =
-    get_latest_event(previous_event, collection, key, previous_id, lock_handle, LockType::Write);
+    ObjectEventHandle previous_version;
+    auto previous_event = get_latest_event(collection, key, previous_id, lock_handle, LockType::Write);
 
-    if(has_previous_event)
+    if(previous_event.valid())
     {
-        has_previous_version =
-        get_previous_version(s, previous_version, previous_event, lock_handle, LockType::Write);
+        previous_version = get_previous_version(s, previous_event, lock_handle, LockType::Write);
 
-        if(has_previous_version)
+        if(previous_version.valid())
         {
             number = previous_version.version_number() + 1;
         }
     }
 
-    json::Document policy("");
-
-    if(has_previous_version && previous_version.get_policy(policy) &&
-       !check_object_policy(policy, op_context, collection, key, path, OperationType::PutObject, lock_handle))
+    if(!path.empty() && !previous_version.valid())
     {
-        log_debug("rejected put because of policy");
+        // can't update field of non-existing version
         res = INVALID_EVENT;
     }
-    else if(!path.empty() && !has_previous_version)
+    else if(!previous_version.valid())
     {
-        res = INVALID_EVENT;
-    }
-    else if(!path.empty())
-    {
-        json::Document view = previous_version.value();
-        json::Document doc = view.duplicate(true);
-        
-        if(doc.insert(path, to_put))
+        if(op_type == OperationType::RemoveObject)
         {
-            res = put_next_version(op_context, collection, key, doc, number, previous_id,
-                                   previous_version, lock_handle);
+            res = INVALID_EVENT;
+        }
+        else
+        {
+            // Create a new object
+            res = put_next_version(op_context, collection, key, to_write, number, previous_id, previous_version, lock_handle, read_set, write_set);
         }
     }
     else
     {
-        res = put_next_version(op_context, collection, key, to_put, number, previous_id,
-                               previous_version, lock_handle);
+        auto value = previous_version.value();
+        auto policy = previous_version.get_policy();
+
+        if(!policy.empty() && !check_object_policy(policy, op_context, collection, key, path, op_type, lock_handle))
+        {
+            log_debug("rejected add because of object policy");
+            res = INVALID_EVENT;
+        }
+        else
+        {
+            if(op_type == OperationType::AddToObject)
+            {
+                json::Document doc = value.duplicate(true);
+                doc.add(path, to_write);
+
+                res = put_next_version(op_context, collection, key, doc, number, previous_id, previous_version, lock_handle, read_set, write_set);
+            }
+            else if(op_type == OperationType::PutObject)
+            {
+                if(path.empty())
+                {
+                    res = put_next_version(op_context, collection, key, to_write, number, previous_id, previous_version, lock_handle, read_set, write_set);
+                }
+                else
+                {
+                    json::Document doc = value.duplicate(true);
+                    doc.insert(path, to_write);
+
+                    res = put_next_version(op_context, collection, key, doc, number, previous_id, previous_version, lock_handle, read_set, write_set);
+                }
+            }
+            else if(op_type == OperationType::RemoveObject)
+            {
+                res = put_tombstone(op_context, previous_id, lock_handle);
+
+                // put-tombstone doesn't update the index
+                auto &col = get_collection(collection);
+                col.primary_index().insert(key, res);
+
+                m_object_count--;
+            }
+            else
+            {
+                throw std::runtime_error("Can't write: unknown op_type");
+            }
+        }
     }
 
     lock_handle.clear();
@@ -681,7 +633,9 @@ event_id_t Ledger::put_next_version(const OpContext &op_context,
                                     version_number_t version_number,
                                     event_id_t previous_id,
                                     const ObjectEventHandle &previous_version,
-                                    LockHandle &lock_handle)
+                                    LockHandle &lock_handle,
+                                    const std::unordered_set<event_id_t> &read_set,
+                                    const std::unordered_set<event_id_t> &write_set)
 {
     if(!op_context.valid())
     {
@@ -701,15 +655,15 @@ event_id_t Ledger::put_next_version(const OpContext &op_context,
 
     json::Writer writer;
 
-    writer.start_array("");
-    writer.write_integer("", static_cast<int32_t>(ObjectEventType::NewVersion));
-    writer.write_string("", op_context.to_string());
+    writer.start_array();
+    writer.write_integer(static_cast<int32_t>(ObjectEventType::NewVersion));
+    writer.write_string(op_context.to_string());
 
     if(version_number == INITIAL_VERSION_NO)
     {
         m_object_count++;
-        writer.write_integer("", INVALID_BLOCK);
-        writer.write_integer("", 0);
+        writer.write_integer(INVALID_BLOCK);
+        writer.write_integer(0);
     }
     else
     {
@@ -722,8 +676,8 @@ event_id_t Ledger::put_next_version(const OpContext &op_context,
             index->remove(view, key);
         }
 
-        writer.write_integer("", previous_id.block);
-        writer.write_integer("", previous_id.index);
+        writer.write_integer(previous_id.block);
+        writer.write_integer(previous_id.index);
     }
 
     // check if any indexes match
@@ -737,13 +691,34 @@ event_id_t Ledger::put_next_version(const OpContext &op_context,
 
     if(previous_version.valid())
     {
-        writer.write_integer("", previous_version.version_number() + 1);
+        writer.write_integer(previous_version.version_number() + 1);
     }
     else
     {
-        writer.write_integer("", INITIAL_VERSION_NO);
+        writer.write_integer(INITIAL_VERSION_NO);
     }
+    
+    writer.start_array();
+    for(auto &read: read_set)
+    {
+        writer.start_array();
+        writer.write_integer(read.shard);
+        writer.write_integer(read.block);
+        writer.write_integer(read.index);
+        writer.end_array();
+    }
+    writer.end_array();
 
+    writer.start_array();
+    for(auto &write: write_set)
+    {
+        writer.start_array();
+        writer.write_integer(write.shard);
+        writer.write_integer(write.block);
+        writer.write_integer(write.index);
+        writer.end_array();
+    }
+    writer.end_array();
     writer.end_array();
 
     auto new_version = writer.make_document();
@@ -754,35 +729,35 @@ event_id_t Ledger::put_next_version(const OpContext &op_context,
     event_id_t event_id = { shard_no, pending->identifier(), index };
 
     bitstream index_changes;
-    index_changes << collection;
+    std::string index_name;
+    index_changes << collection << index_name;
     col.primary_index().insert(key, event_id, &index_changes);
 #ifndef TEST
     col.notify_triggers(m_enclave.remote_parties());
 #endif
     m_version_count += 1;
 
-    ObjectEventHandle version;
-    version.assign(std::move(new_version));
+    ObjectEventHandle version(std::move(new_version));
 
-    lock_handle.release_block(shard_no, pending->identifier(), LockType::Write);
+    auto pending_id = pending->identifier();
+    auto pending_size = pending->num_events();
+
+    lock_handle.release_block(shard_no, pending_id, LockType::Write);
 
     // forward only the index to downstream servers
-    send_index_updates_to_downstream(index_changes, shard_no, pending->page_no());
+    send_index_updates_to_downstream(index_changes, shard_no, pending_id, pending_size);
 
     return event_id;
 }
 
-void Ledger::send_index_updates_to_downstream(const bitstream &index_changes, shard_id_t shard, page_no_t invalidated_page)
+void Ledger::send_index_updates_to_downstream(const bitstream &index_changes, shard_id_t shard, page_no_t invalidated_page, Block::int_type block_size)
 {
 #ifdef TEST
     (void)index_changes;
     (void)shard;
     (void)invalidated_page;
+    (void)block_size;
 #else
-    m_put_object_index_mutex.lock();
-    size_t id = ++m_put_object_index_last_id;
-    m_put_object_index_mutex.unlock();
-
     for(auto downstream_id : m_enclave.peers().get_downstream_set())
     {
         //        log_debug("forwarding index to downstream_id=" + std::to_string(downstream_id));
@@ -794,75 +769,34 @@ void Ledger::send_index_updates_to_downstream(const bitstream &index_changes, sh
         }
         peer->lock();
 
+        std::string index_name;
+
         bitstream update_msg;
         update_msg << static_cast<mtype_data_t>(MessageType::PushIndexUpdate);
-        update_msg << id;
         update_msg << index_changes;
         update_msg << shard;
         update_msg << invalidated_page;
+        update_msg << block_size;
+        update_msg << index_name;
+
         peer->send(update_msg);
         peer->unlock();
     }
 #endif
 }
 
-void Ledger::put_object_index_from_upstream(size_t input_id, bitstream *input_changes, shard_id_t input_shard, page_no_t input_block_page_no)
+void Ledger::put_object_index_from_upstream(bitstream &changes, shard_id_t shard_id, page_no_t block_page_no, Block::int_type block_size)
 {
-    m_put_object_index_mutex.lock();
-    m_put_object_index_queue.emplace(input_id, input_changes, input_shard, input_block_page_no);
-    if(m_put_object_index_running)
-    {
-        m_put_object_index_mutex.unlock();
-        return;
-    }
+    auto &shard = *m_shards[shard_id];
+    WriteLock lock(shard);
 
-    m_put_object_index_running = true;
-    m_put_object_index_mutex.unlock();
+    std::string collection, index;
+    changes >> collection >> index;
+ 
+    shard.set_pending_block(block_page_no, block_size);
 
-    for(;;)
-    {
-        m_put_object_index_mutex.lock();
-        if(m_put_object_index_queue.empty())
-        {
-            m_put_object_index_running = false;
-            m_put_object_index_mutex.unlock();
-            return;
-        }
-
-        auto[id, changes, shard_id, block_page_no] = m_put_object_index_queue.top();
-        if(m_put_object_index_last_id && id != m_put_object_index_last_id + 1)
-        {
-            // although TCP guarantees packet order, it can still be reordered at this function.
-            //            log_debug("Waiting for Update #" +
-            //            std::to_string(m_put_object_index_last_id+1) + " got #" +
-            //            std::to_string(id) + ", return.");
-            m_put_object_index_running = false;
-            m_put_object_index_mutex.unlock();
-            return;
-        }
-
-        // FIXME: what if the very first update is reordered?
-        m_put_object_index_last_id = id;
-        m_put_object_index_queue.pop();
-        m_put_object_index_mutex.unlock();
-
-        // update string index
-        std::string collection;
-        *changes >> collection;
-        auto &col = get_collection(collection, true);
-        col.primary_index().apply_changes(*changes);
-
-        // invalidate data block cache
-        if(block_page_no != INVALID_PAGE_NO)
-        {
-            auto &shard = *m_shards[shard_id];
-            shard.write_lock();
-            shard.discard_cached_block(block_page_no);
-            shard.write_unlock();
-        }
-
-        delete changes;
-    }
+    auto &col = get_collection(collection, true);
+    col.update_index(index, changes);
 }
 
 bool Ledger::create_index(const std::string &collection, const std::string &name, const std::vector<std::string> &paths)
@@ -880,68 +814,47 @@ bool Ledger::drop_index(const std::string &collection, const std::string &name)
 bool Ledger::clear(const OpContext &op_context, const std::string &collection)
 {
     auto &col = get_collection(collection);
-
-    std::string pos;
-    bool done = false;
-
-    while(!done)
+    auto it = col.primary_index().begin();
+ 
+    while(!it.at_end())
     {
-        auto it = col.primary_index().begin_at(pos);
+        auto key = it.key();
+        auto previous_id = it.value();
 
         LockHandle lock_handle(*this);
+        
+        auto shard = get_shard(collection, key);
+        auto pending = lock_handle.get_pending_block(shard, LockType::Write);
 
-        // Check a batch and then clean up
-        // TODO come up with a generic way to manage long-running tasks
-        constexpr size_t BATCH_SIZE = 100;
-        size_t c = 0;
-
-        for(; !it.at_end() && c < BATCH_SIZE; ++it)
+        auto previous_event = get_event(previous_id, lock_handle, LockType::Write);
+        
+        if(!previous_event.valid())
         {
-            const std::string key = it.key();
-
-            auto shard = get_shard(collection, key);
-            auto pending = lock_handle.get_pending_block(shard, LockType::Write);
-
-            event_id_t previous_id = it.value();
-            ObjectEventHandle previous_event;
-            // FIXME: get_event loads a block and doesn't evict it for you, then out of memory
-            if(!get_event(previous_event, previous_id, lock_handle, LockType::Write))
-            {
-                throw std::runtime_error("Broken object reference");
-            }
-
-            if(previous_event.get_type() != ObjectEventType::Deletion)
-            {
-                auto index = put_tombstone(op_context, collection, key, previous_id, lock_handle);
-                bitstream changes;
-                changes << collection;
-                it.set_value({ shard, pending->identifier(), index }, &changes);
-                m_object_count -= 1;
-
-                // tell downstream
-                send_index_updates_to_downstream(changes, shard, pending->identifier());
-            }
-
-            c += 1;
+            throw std::runtime_error("Broken object reference");
         }
 
-        if(it.at_end())
+        if(previous_event.get_type() != ObjectEventType::Deletion)
         {
-            done = true;
-        }
-        else
-        {
-            pos = it.key();
+            auto id = put_tombstone(op_context, previous_id, lock_handle);
+            bitstream index_changes;
+            std::string index_name;
+
+            index_changes << collection << index_name;
+            
+            it.set_value(id, &index_changes);
+
+            m_object_count--;
+           
+            // tell downstream
+            send_index_updates_to_downstream(index_changes, shard, pending->identifier(), pending->num_events());
         }
 
-        it.clear();
-        lock_handle.clear(); // don't check evict, since we are going to call organize_ledger for
-                             // all shards
+        ++it;
+    }
 
-        for(uint16_t i = 0; i < NUM_SHARDS; ++i)
-        {
-            organize_ledger(i);
-        }
+    for(uint16_t i = 0; i < NUM_SHARDS; ++i)
+    {
+        organize_ledger(i);
     }
 
     return true;
@@ -950,26 +863,24 @@ bool Ledger::clear(const OpContext &op_context, const std::string &collection)
 void Ledger::organize_ledger(shard_id_t shard_no)
 {
     auto &shard = *m_shards[shard_no];
-    shard.write_lock();
+    WriteLock lock(shard);
 
     auto pending = shard.get_block(shard.pending_block_id());
 
     // Wait until we have reached at least min block size
-    if(pending->byte_size() < MIN_BLOCK_SIZE)
+    if(pending->get_data_size() < MIN_BLOCK_SIZE)
     {
-        shard.write_unlock();
         return;
     }
+
     pending->seal();
 
     auto newb = shard.generate_block();
     newb->flush_page();
-
-    shard.write_unlock();
+    pending->flush_page();
 }
 
-bool Ledger::get_latest_version(ObjectEventHandle &event,
-                                const OpContext &op_context,
+ObjectEventHandle Ledger::get_latest_version(const OpContext &op_context,
                                 const std::string &collection,
                                 const std::string &key,
                                 const std::string &path,
@@ -978,73 +889,48 @@ bool Ledger::get_latest_version(ObjectEventHandle &event,
                                 LockType lock_type,
                                 const OperationType access_type)
 {
-    if(!get_latest_event(event, collection, key, id, lock_handle, lock_type))
-    {
-        return false;
-    }
+    auto event = get_latest_event(collection, key, id, lock_handle, lock_type);
 
-    while(event.get_type() != ObjectEventType::NewVersion)
+    while(event.valid() && event.get_type() != ObjectEventType::NewVersion)
     {
         if(event.get_type() == ObjectEventType::Deletion)
         {
-            event.clear();
             lock_handle.release_block(id.shard, id.block, lock_type);
             id = INVALID_EVENT;
-            return false;
+            return ObjectEventHandle();
         }
 
         block_id_t previous_block = id.block;
 
         id = { id.shard, event.previous_block(), event.previous_index() };
-        lock_handle.get_block(id.shard, id.block, lock_type)->get_event(event, id.index);
+        event = lock_handle.get_block(id.shard, id.block, lock_type)->get_event(id.index);
 
         lock_handle.release_block(id.shard, previous_block, lock_type);
     }
 
-    json::Document policy("");
+    if(!event.valid())
+    {
+        return ObjectEventHandle();
+    }
 
-    if(!event.get_policy(policy))
+    auto policy = event.get_policy();
+
+    if(policy.empty())
     {
         // Object has no security policy
-        return true;
+        return event;
     }
     else
     {
-        return check_object_policy(policy, op_context, collection, key, path, access_type, lock_handle);
+        if(check_object_policy(policy, op_context, collection, key, path, access_type, lock_handle))
+        {
+            return event;
+        }
+        else
+        {
+            return ObjectEventHandle();
+        }
     }
-}
-
-bool Ledger::get_latest_event(ObjectEventHandle &hdl,
-                              const std::string &collection,
-                              const std::string &key,
-                              event_id_t &event_id,
-                              LockHandle &lock_handle,
-                              LockType lock_type)
-{
-    event_id = INVALID_EVENT;
-
-    if(key.empty())  
-    {
-        return false;
-    }
-
-    auto p_col = try_get_collection(collection);
-
-    if(!p_col)
-    {
-        return false;
-    }
-
-    auto &col = *p_col;
-
-    if(!col.primary_index().get(key, event_id))
-    {
-        return false;
-    }
-
-    auto block = lock_handle.get_block(event_id.shard, event_id.block, lock_type);
-    block->get_event(hdl, event_id.index);
-    return true;
 }
 
 uint32_t Ledger::count_objects(const OpContext &op_context, const std::string &collection, const json::Document &predicates)
@@ -1068,86 +954,35 @@ uint32_t Ledger::count_objects(const OpContext &op_context, const std::string &c
     return count;
 }
 
-event_id_t
-Ledger::remove(const OpContext &op_context, const std::string &collection, const std::string &key, LockHandle *lock_handle_)
-{
-    if(!Ledger::is_valid_key(key))
-    {
-        return INVALID_EVENT;
-    }
-
-    LockHandle lock_handle(*this, lock_handle_);
-    event_id_t previous_id = INVALID_EVENT;
-    ObjectEventHandle hdl;
-
-    auto shard = get_shard(collection, key);
-    auto &col = get_collection(collection);
-
-    auto pending = lock_handle.get_pending_block(shard, LockType::Write);
-
-    if(!get_latest_event(hdl, collection, key, previous_id, lock_handle, LockType::Write))
-    {
-        // no such object.
-        return INVALID_EVENT;
-    }
-
-    if(hdl.get_type() == ObjectEventType::Deletion)
-    {
-        return INVALID_EVENT;
-    }
-
-    auto index = put_tombstone(op_context, collection, key, previous_id, lock_handle);
-
-    event_id_t event_id;
-    event_id.shard = shard;
-    event_id.block = pending->identifier();
-    event_id.index = index;
-
-    col.primary_index().insert(key, event_id);
-#ifndef TEST
-    col.notify_triggers(m_enclave.remote_parties());
-#endif
-
-    m_object_count -= 1;
-    lock_handle.clear();
-
-    if(!lock_handle_)
-    {
-        organize_ledger(shard);
-    }
-
-    return event_id;
-}
-
-event_index_t Ledger::put_tombstone(const OpContext &op_context,
-                                    const std::string &collection,
-                                    const std::string &key,
-                                    const event_id_t &previous_id,
-                                    LockHandle &lock_handle)
+event_id_t Ledger::put_tombstone(const OpContext &op_context,
+                                 const event_id_t &previous_id,
+                                 LockHandle &lock_handle)
 {
     if(!op_context.valid())
     {
         throw std::runtime_error("Cannot modify using invalid identity");
     }
 
-    auto shard = get_shard(collection, key);
+    auto shard = previous_id.shard;
     auto pending = lock_handle.get_pending_block(shard, LockType::Write);
 
     json::Writer writer;
 
-    writer.start_array("");
-    writer.write_integer("", static_cast<int32_t>(ObjectEventType::Deletion));
-    writer.write_string("", op_context.to_string());
-    writer.write_integer("", previous_id.block);
-    writer.write_integer("", previous_id.index);
+    writer.start_array();
+    writer.write_integer(static_cast<int32_t>(ObjectEventType::Deletion));
+    writer.write_string(op_context.to_string());
+    writer.write_integer(previous_id.block);
+    writer.write_integer(previous_id.index);
     writer.end_array();
 
     auto doc = writer.make_document();
     auto index = pending->insert(doc);
     pending->flush_page();
 
+    event_id_t res = {shard, pending->identifier(), index}; 
     lock_handle.release_block(shard, pending->identifier(), LockType::Write);
-    return index;
+
+    return res;
 }
 
 ObjectListIterator Ledger::find(const OpContext &op_context,
@@ -1245,8 +1080,7 @@ ObjectListIterator Ledger::find(const OpContext &op_context,
     {
         // Do linear scan :(
         log_debug("linear scan");
-        std::unique_ptr<StringIndex::LinearScanKeyProvider> key_provider(
-        new StringIndex::LinearScanKeyProvider(col.primary_index()));
+        std::unique_ptr<ObjectKeyProvider> key_provider(new HashMap::LinearScanKeyProvider(col.primary_index()));
 
         return ObjectListIterator(op_context, collection, predicates, *this, lock_handle, std::move(key_provider));
     }
@@ -1256,15 +1090,6 @@ ObjectIterator
 Ledger::iterate(const OpContext &op_context, const std::string &collection, const std::string &key, const std::string &path, LockHandle *lock_handle)
 {
     return ObjectIterator(op_context, collection, key, path, *this, lock_handle);
-}
-
-void Ledger::load_upstream_index_root(const std::vector<std::string> &collection_names)
-{
-    for(auto &name : collection_names)
-    {
-        log_debug("Reload StringIndex root of collection [" + name + "]");
-        get_collection(name, true).primary_index().reload_root_node();
-    }
 }
 
 void Ledger::dump_metadata(bitstream &output)

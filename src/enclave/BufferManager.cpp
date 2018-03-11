@@ -13,7 +13,7 @@ BufferManager::shard_t::~shard_t()
         auto meta = it.second;
         {
             meta->lock();
-            flush_page(*meta);
+            flush_page_internal(*meta);
             meta->unlock();
         }
         delete meta->page();
@@ -108,7 +108,7 @@ void BufferManager::shard_t::flush_all_pages()
     {
         auto &meta = *it.second;
         meta.lock();
-        flush_page(meta);
+        flush_page_internal(meta);
         meta.unlock();
     }
     m_lock.read_unlock();
@@ -136,7 +136,13 @@ void BufferManager::shard_t::discard_cache(page_no_t page_no)
     }
 
     m_evict_mutex.lock();
-    m_evict_list.erase(it->second->evict_list_iter);
+
+    // Make sure it hasn't been evicted yet
+    if(it->second->evict_list_iter != m_evict_list.end())
+    {
+        m_evict_list.erase(it->second->evict_list_iter);
+    }
+
     m_evict_mutex.unlock();
 
     discard_cache(it->second);
@@ -157,7 +163,7 @@ void BufferManager::shard_t::discard_all_cache()
     m_lock.write_unlock();
 }
 
-void BufferManager::shard_t::flush_page(internal_page_meta_t &meta)
+void BufferManager::shard_t::flush_page_internal(internal_page_meta_t &meta)
 {
     if(meta.dirty())
     {
@@ -176,7 +182,7 @@ void BufferManager::shard_t::flush_page(page_no_t page_no)
     m_lock.read_unlock();
 
     meta.lock();
-    flush_page(meta);
+    this->flush_page_internal(meta);
     meta.unlock();
 }
 
@@ -189,7 +195,7 @@ BufferManager::metas_map_t::iterator BufferManager::shard_t::unload_page(page_no
 
     meta->lock();
     assert(!meta->cnt_pin);
-    flush_page(*meta);
+    flush_page_internal(*meta);
     m_loaded_size -= meta->size();
     meta->unlock();
 
@@ -255,51 +261,11 @@ BufferManager::~BufferManager()
     }
 }
 
-void BufferManager::mark_page_dirty(page_no_t page_no)
-{
-    auto shard = m_shards[page_no % NUM_SHARDS];
-    shard->mark_page_dirty(page_no);
-}
-
-void BufferManager::flush_page(page_no_t page_no)
-{
-    auto shard = m_shards[page_no % NUM_SHARDS];
-    shard->flush_page(page_no);
-}
-
-void BufferManager::unpin_page(page_no_t page_no)
-{
-    auto shard = m_shards[page_no % NUM_SHARDS];
-    shard->unpin_page(page_no);
-}
-
 void BufferManager::clear_cache()
 {
     for(auto &shard : m_shards)
     {
         shard->clear_cache();
-    }
-}
-
-void BufferManager::discard_cache(page_no_t page_no)
-{
-    auto shard = m_shards[page_no % NUM_SHARDS];
-    shard->discard_cache(page_no);
-}
-
-void BufferManager::discard_all_cache()
-{
-    for(auto &shard : m_shards)
-    {
-        shard->discard_all_cache();
-    }
-}
-
-void BufferManager::flush_all_pages()
-{
-    for(auto &shard : m_shards)
-    {
-        shard->flush_all_pages();
     }
 }
 
